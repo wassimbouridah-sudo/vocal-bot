@@ -1,0 +1,11 @@
+{
+  "token": "TON_TOKEN_ICI",
+
+  "tracked_voice_channel_id": 123456789012345678,
+  "announce_channel_id":      123456789012345678,
+  "top1_role_id":             123456789012345678,
+
+  "announce_day":    0,
+  "announce_hour":   18,
+  "announce_minute": 0
+}
