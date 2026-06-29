@@ -43,11 +43,14 @@ def env(key: str, fallback):
     return fallback
 
 TRACKED_CHANNEL_ID  = env("TRACKED_CHANNEL_ID",  config["tracked_voice_channel_id"])
+# CORRECTIF : salon ranked au lieu du salon annonce
+RANKED_CHANNEL_ID   = int(os.environ.get("RANKED_CHANNEL_ID", "1480760348905832582"))
 ANNOUNCE_CHANNEL_ID = env("ANNOUNCE_CHANNEL_ID",  config["announce_channel_id"])
 TOP_ROLE_ID         = env("TOP_ROLE_ID",          config["top1_role_id"])
-ANNOUNCE_DAY        = env("ANNOUNCE_DAY",         config["announce_day"])
-ANNOUNCE_HOUR       = env("ANNOUNCE_HOUR",        config["announce_hour"])
-ANNOUNCE_MINUTE     = env("ANNOUNCE_MINUTE",      config["announce_minute"])
+# CORRECTIF : dimanche = 6, heure 21h59 UTC = 23h59 heure France (UTC+2)
+ANNOUNCE_DAY        = int(os.environ.get("ANNOUNCE_DAY",    "6"))
+ANNOUNCE_HOUR       = int(os.environ.get("ANNOUNCE_HOUR",   "21"))
+ANNOUNCE_MINUTE     = int(os.environ.get("ANNOUNCE_MINUTE", "59"))
 TOKEN               = os.environ.get("DISCORD_TOKEN") or config["token"]
 
 # ── Database ──────────────────────────────────────────────────────────────────
@@ -79,7 +82,10 @@ def init_db():
     log.info("Base de données initialisée.")
 
 def current_week_start() -> str:
-    today = datetime.utcnow().date()
+    # CORRECTIF : basé sur l'heure France (UTC+2) pour que la semaine
+    # corresponde à ce que voient les élèves
+    now_france = datetime.utcnow() + timedelta(hours=2)
+    today = now_france.date()
     monday = today - timedelta(days=today.weekday())
     return str(monday)
 
@@ -101,7 +107,8 @@ def close_session(user_id: int):
         """, (time.time(), str(user_id)))
         db.commit()
 
-def get_top3(week: str) -> list[dict]:
+def get_all_ranked(week: str) -> list[dict]:
+    """Récupère TOUS les élèves classés par temps cette semaine."""
     with get_db() as db:
         rows = db.execute("""
             SELECT user_id,
@@ -110,9 +117,11 @@ def get_top3(week: str) -> list[dict]:
             WHERE week_start = ?
             GROUP BY user_id
             ORDER BY total_seconds DESC
-            LIMIT 3
         """, (time.time(), week)).fetchall()
     return [{"user_id": r["user_id"], "seconds": r["total_seconds"]} for r in rows]
+
+def get_top3(week: str) -> list[dict]:
+    return get_all_ranked(week)[:3]
 
 def save_weekly_top(week: str, top: list[dict]):
     ids = [t["user_id"] for t in top]
@@ -180,6 +189,7 @@ async def on_voice_state_update(member: discord.Member, before: discord.VoiceSta
 # ── Weekly task ───────────────────────────────────────────────────────────────
 @tasks.loop(minutes=1)
 async def weekly_announcement():
+    # CORRECTIF : on compare en heure UTC
     now = datetime.utcnow()
     if now.weekday() != ANNOUNCE_DAY:
         return
@@ -192,19 +202,29 @@ async def before_weekly():
     await bot.wait_until_ready()
 
 async def do_weekly_announcement(week: str | None = None):
-    announce_channel = bot.get_channel(ANNOUNCE_CHANNEL_ID)
-    if not announce_channel:
-        log.error("Salon d'annonce introuvable !")
+    # CORRECTIF : publier dans le salon ranked
+    ranked_channel = bot.get_channel(RANKED_CHANNEL_ID)
+    if not ranked_channel:
+        log.error("Salon ranked introuvable !")
         return
+
     if week is None:
         week = current_week_start()
-    top = get_top3(week)
-    if not top:
-        await announce_channel.send("😴 Personne n'a été actif dans le vocal cette semaine !")
+
+    # CORRECTIF : récupère TOUS les élèves, pas juste le top 3
+    all_ranked = get_all_ranked(week)
+
+    if not all_ranked:
+        await ranked_channel.send("😴 Personne n'a été actif dans le vocal cette semaine !")
         return
+
+    top = all_ranked[:3]
     save_weekly_top(week, top)
-    guild = announce_channel.guild
+
+    guild = ranked_channel.guild
     top_role = guild.get_role(TOP_ROLE_ID)
+
+    # Rotation du rôle top 1
     prev_top1_id = get_previous_top1(week)
     if prev_top1_id and top_role:
         prev_member = guild.get_member(int(prev_top1_id))
@@ -213,6 +233,7 @@ async def do_weekly_announcement(week: str | None = None):
                 await prev_member.remove_roles(top_role, reason="Rotation top 1 vocal")
             except discord.Forbidden:
                 log.warning("Permission manquante pour retirer le rôle.")
+
     if top_role and top:
         new_top1_member = guild.get_member(int(top[0]["user_id"]))
         if new_top1_member:
@@ -220,25 +241,31 @@ async def do_weekly_announcement(week: str | None = None):
                 await new_top1_member.add_roles(top_role, reason="Top 1 vocal de la semaine")
             except discord.Forbidden:
                 log.warning("Permission manquante pour ajouter le rôle.")
+
+    # Construction de l'embed avec TOUS les élèves
     medals = ["🥇", "🥈", "🥉"]
+    lines = []
+    for i, entry in enumerate(all_ranked):
+        member = guild.get_member(int(entry["user_id"]))
+        name = member.display_name if member else f"#{entry['user_id']}"
+        prefix = medals[i] if i < 3 else f"`#{i+1}`"
+        extra = f"  ← {top_role.mention}" if i == 0 and top_role else ""
+        lines.append(f"{prefix} **{name}**{extra} — ⏱️ {fmt_duration(entry['seconds'])}")
+
+    # Dernier du classement — mention spéciale
+    if len(all_ranked) > 1:
+        lines[-1] += "  ← 💀 Dernier"
+
     embed = discord.Embed(
-        title="🎙️ Top vocal de la semaine !",
-        description=f"Semaine du **{week}**",
+        title="⚔️ CLASSEMENT RANKED — Semaine du " + week,
+        description="\n".join(lines),
         color=discord.Color.gold(),
         timestamp=datetime.utcnow()
     )
-    for i, entry in enumerate(top):
-        member = guild.get_member(int(entry["user_id"]))
-        name   = member.display_name if member else f"Utilisateur #{entry['user_id']}"
-        extra  = f"  ← {top_role.mention}" if i == 0 and top_role else ""
-        embed.add_field(
-            name=f"{medals[i]} {name}{extra}",
-            value=f"⏱️ **{fmt_duration(entry['seconds'])}**",
-            inline=False
-        )
-    embed.set_footer(text="Rendez-vous la semaine prochaine !")
-    await announce_channel.send("@here", embed=embed)
-    log.info("Annonce hebdomadaire envoyée.")
+    embed.set_footer(text="Les compteurs se reset maintenant. Bonne semaine à tous.")
+
+    await ranked_channel.send("@here", embed=embed)
+    log.info("Classement ranked envoyé.")
 
 # ── Slash commands ────────────────────────────────────────────────────────────
 @bot.tree.command(name="stats", description="Affiche ton temps dans le salon vocal cette semaine")
@@ -260,32 +287,33 @@ async def stats(interaction: discord.Interaction):
         ephemeral=True
     )
 
-@bot.tree.command(name="top", description="Affiche le classement vocal de la semaine en cours")
+@bot.tree.command(name="top", description="Affiche le classement vocal complet de la semaine")
 async def top_command(interaction: discord.Interaction):
     week = current_week_start()
-    top  = get_top3(week)
-    if not top:
+    all_ranked = get_all_ranked(week)
+    if not all_ranked:
         await interaction.response.send_message("Aucune donnée pour cette semaine.", ephemeral=True)
         return
     medals = ["🥇", "🥈", "🥉"]
-    lines  = []
-    for i, entry in enumerate(top):
+    lines = []
+    for i, entry in enumerate(all_ranked):
         member = interaction.guild.get_member(int(entry["user_id"]))
-        name   = member.display_name if member else f"#{entry['user_id']}"
-        lines.append(f"{medals[i]} **{name}** — {fmt_duration(entry['seconds'])}")
+        name = member.display_name if member else f"#{entry['user_id']}"
+        prefix = medals[i] if i < 3 else f"`#{i+1}`"
+        lines.append(f"{prefix} **{name}** — {fmt_duration(entry['seconds'])}")
     embed = discord.Embed(
-        title="🎙️ Classement vocal — semaine en cours",
+        title="⚔️ Classement vocal — semaine en cours",
         description="\n".join(lines),
         color=discord.Color.blurple()
     )
     await interaction.response.send_message(embed=embed)
 
-@bot.tree.command(name="announce", description="[ADMIN] Force l'annonce hebdomadaire maintenant")
+@bot.tree.command(name="announce", description="[ADMIN] Force l'annonce ranked maintenant")
 @app_commands.checks.has_permissions(administrator=True)
 async def force_announce(interaction: discord.Interaction):
     await interaction.response.defer(ephemeral=True)
     await do_weekly_announcement()
-    await interaction.followup.send("✅ Annonce envoyée !", ephemeral=True)
+    await interaction.followup.send("✅ Classement ranked envoyé !", ephemeral=True)
 
 @force_announce.error
 async def force_announce_error(interaction: discord.Interaction, error):
